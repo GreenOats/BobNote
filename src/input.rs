@@ -43,8 +43,7 @@ impl App {
         if cfg.corkboard.matches(key) {
             self.corkboard_open = !self.corkboard_open;
             if !self.corkboard_open {
-                // Collapsing: restore shell focus.
-                self.focus = Focus::Shell;
+                self.focus = self.focus_for_active_workspace();
             }
             return Ok(());
         }
@@ -214,16 +213,14 @@ impl App {
                 .and_then(|cb| cb.get_text().ok())
                 .unwrap_or_default();
             if !text.is_empty() {
-                enum PasteTarget { Bg, BgShell(usize), TextNote(usize), ShellNote(usize), None }
+                enum PasteTarget { BgShell(usize), TextNote(usize), ShellNote(usize), None }
                 let target = match &self.focus {
-                    Focus::Shell                            => PasteTarget::Bg,
                     Focus::BackgroundShell(i)               => PasteTarget::BgShell(*i),
                     Focus::Note(i, NoteType::Text)      => PasteTarget::TextNote(*i),
                     Focus::Note(i, NoteType::Shell)     => PasteTarget::ShellNote(*i),
                     _                                       => PasteTarget::None,
                 };
                 match target {
-                    PasteTarget::Bg => { self.pty.write_bytes(text.as_bytes())?; }
                     PasteTarget::BgShell(idx) => {
                         if let NoteKind::Shell { pty, .. } = &mut self.notes[idx].kind {
                             let _ = pty.write_bytes(text.as_bytes());
@@ -257,7 +254,7 @@ impl App {
         }
 
         // Pull focus out to avoid simultaneous borrow issues.
-        let focus = std::mem::replace(&mut self.focus, Focus::Shell);
+        let focus = std::mem::replace(&mut self.focus, Focus::BackgroundShell(0));
 
         match focus {
             // ── Background shell mode ───────────────────────────────────────
@@ -348,21 +345,21 @@ impl App {
                 if ctrl && key.code == KeyCode::Char('v') {
                     if let NoteKind::Shell { parser, scroll_offset, .. } = &self.notes[bg_idx].kind {
                         let (live_crow, ccol) = parser.screen().cursor_position();
-                        let term_rows = self.term_size.1 as i64;
+                        // anchor_row is screen-absolute: parser row + BG_SHELL_INSET offset.
+                        // Clamp to the note's visible area (bg note starts at BG_SHELL_INSET,
+                        // ends at term_rows - BG_SHELL_INSET - 1).
+                        let note_rows = self.notes[bg_idx].data.height as i64;
                         let anchor_row = (live_crow as i64 + *scroll_offset)
-                            .clamp(0, term_rows - 1) as u16;
+                            .clamp(0, note_rows - 1) as u16
+                            + BG_SHELL_INSET;
                         self.focus = Focus::Selecting {
                             anchor_col: ccol,
                             anchor_row,
                             cursor_col: ccol,
                             cursor_row: anchor_row,
+                            from_bg_shell: Some(bg_idx),
                         };
                     }
-                    return Ok(());
-                }
-                // Ctrl+E: return to main shell (escape hatch)
-                if ctrl && key.code == KeyCode::Char('e') {
-                    self.focus = Focus::Shell;
                     return Ok(());
                 }
                 // Shift+Insert: paste from clipboard into bg shell note
@@ -381,6 +378,36 @@ impl App {
                     self.focus = Focus::BackgroundShell(bg_idx);
                     return Ok(());
                 }
+                // Alt+C: re-copy the stored selection without snapping the scroll.
+                if alt && !ctrl && key.code == KeyCode::Char('c') {
+                    if let Some((sc, sr, ec, er)) = self.text_selection {
+                        self.copy_shell_note_stream_selection(
+                            bg_idx,
+                            sc, sr.saturating_sub(BG_SHELL_INSET),
+                            ec, er.saturating_sub(BG_SHELL_INSET),
+                        );
+                    }
+                    self.focus = Focus::BackgroundShell(bg_idx);
+                    return Ok(());
+                }
+                // Ctrl+Alt+I: toggle PTY output logging on/off.
+                if cfg.toggle_log.matches(key) {
+                    let logging = matches!(&self.notes[bg_idx].kind,
+                        NoteKind::Shell { log_file, .. } if log_file.is_some());
+                    if logging {
+                        if let NoteKind::Shell { log_file, log_path, .. } =
+                            &mut self.notes[bg_idx].kind
+                        {
+                            *log_file = None; // flushes + closes via BufWriter::drop
+                            *log_path = None;
+                        }
+                        self.focus = Focus::BackgroundShell(bg_idx);
+                    } else {
+                        let default = self.default_log_path(bg_idx);
+                        self.focus = Focus::LoggingSetup(bg_idx, default);
+                    }
+                    return Ok(());
+                }
                 // Everything else: route to bg note's PTY
                 if let NoteKind::Shell { pty, scroll_offset, .. } = &mut self.notes[bg_idx].kind {
                     if *scroll_offset > 0 { *scroll_offset = 0; }
@@ -388,110 +415,6 @@ impl App {
                 }
                 self.focus = Focus::BackgroundShell(bg_idx);
             }
-
-            // ── Shell mode ──────────────────────────────────────────────────
-            Focus::Shell => match (key.modifiers, key.code) {
-                // Enter keyboard visual-block selection mode (vim Ctrl+V style).
-                (KeyModifiers::CONTROL, KeyCode::Char('v')) => {
-                    let (live_crow, ccol) = self.parser.screen().cursor_position();
-                    let term_rows = self.term_size.1 as i64;
-                    let anchor_row = (live_crow as i64 + self.scroll_offset)
-                        .clamp(0, term_rows - 1) as u16;
-                    self.focus = Focus::Selecting {
-                        anchor_col: ccol,
-                        anchor_row,
-                        cursor_col: ccol,
-                        cursor_row: anchor_row,
-                    };
-                    return Ok(());
-                }
-                // Scroll up / down through terminal history.
-                (_, KeyCode::PageUp) => {
-                    if !self.parser.screen().alternate_screen() {
-                        let step = (self.term_size.1 / 2).max(1) as i64;
-                        self.scroll_offset += step;
-                    }
-                    self.focus = Focus::Shell;
-                }
-                (_, KeyCode::PageDown) => {
-                    let min = if self.parser.screen().alternate_screen() {
-                        0
-                    } else {
-                        -(self.term_size.1 as i64 - PROMPT_LINES)
-                    };
-                    let step = (self.term_size.1 / 2).max(1) as i64;
-                    self.scroll_offset = (self.scroll_offset - step).max(min);
-                    self.focus = Focus::Shell;
-                }
-                // Alt+Left: switch to previous workspace
-                (KeyModifiers::ALT, KeyCode::Left) => {
-                    let new_ws = self.active_workspace.saturating_sub(1);
-                    self.switch_workspace(new_ws);
-                }
-                // Alt+Right: switch to next workspace
-                (KeyModifiers::ALT, KeyCode::Right) => {
-                    let new_ws = (self.active_workspace + 1).min(self.workspace_count.saturating_sub(1));
-                    self.switch_workspace(new_ws);
-                }
-                // Alt+=: add workspace
-                (KeyModifiers::ALT, KeyCode::Char('=')) => {
-                    let n = self.workspace_count.saturating_add(1);
-                    self.workspace_count = n;
-                    let new_ws = n - 1;
-                    self.workspace_names.push(format!("WS {n}"));
-                    // Create a dedicated background shell note for the new workspace.
-                    if let Ok(new_idx) = self.new_shell_note() {
-                        self.notes[new_idx].data.workspace_id = new_ws;
-                        self.notes[new_idx].data.is_background = true;
-                        self.notes[new_idx].data.show_border = false;
-                    }
-                    self.focus = Focus::Shell;
-                }
-                // Alt+-: remove the current workspace
-                (KeyModifiers::ALT, KeyCode::Char('-')) if self.workspace_count > 1 => {
-                    let ws = self.active_workspace;
-                    // Trash the background shell note for this workspace so it can be revived.
-                    let bg_indices: Vec<usize> = self.notes.iter().enumerate()
-                        .filter(|(_, n)| n.data.is_background && n.data.workspace_id == ws)
-                        .map(|(i, _)| i)
-                        .collect();
-                    for i in bg_indices.into_iter().rev() {
-                        let note = self.notes.remove(i);
-                        self.trash_note(note);
-                    }
-                    // Reassign any remaining notes on this workspace to the adjacent one,
-                    // and shift down the workspace_id of all notes with a higher id.
-                    let new_ws = ws.saturating_sub(1);
-                    for n in self.notes.iter_mut() {
-                        if n.data.workspace_id == ws {
-                            n.data.workspace_id = new_ws;
-                        } else if n.data.workspace_id > ws {
-                            n.data.workspace_id -= 1;
-                        }
-                    }
-                    self.workspace_names.remove(ws as usize);
-                    self.workspace_count -= 1;
-                    self.switch_workspace(new_ws);
-                }
-                // Shift+Insert: paste from system clipboard into the background terminal.
-                (_, KeyCode::Insert) if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    let text = self.clipboard
-                        .as_mut()
-                        .and_then(|cb| cb.get_text().ok())
-                        .unwrap_or_default();
-                    if !text.is_empty() {
-                        self.pty.write_bytes(text.as_bytes())?;
-                    }
-                    self.focus = Focus::Shell;
-                }
-                _ => {
-                    if self.scroll_offset > 0 {
-                        self.scroll_offset = 0;
-                    }
-                    self.focus = Focus::Shell;
-                    self.pty.write_key(key)?;
-                }
-            },
 
             // ── Note mode ───────────────────────────────────────────────────
             Focus::Note(idx, note_type) => {
@@ -519,9 +442,8 @@ impl App {
                 }
 
                 match (ctrl, alt, key.code) {
-                    // Back to shell / background shell for the active workspace
+                    // Back to background shell for the active workspace
                     (true, false, KeyCode::Char('e')) => {
-                        self.scroll_offset = 0;
                         self.focus = self.focus_for_active_workspace();
                     }
                     // Ctrl+X on checklist: toggle [ ]/[x] prefix.
@@ -594,12 +516,12 @@ impl App {
                         ) {
                             self.corkboard_selected = pos;
                         }
-                        self.focus = Focus::Shell;
+                        self.focus = self.focus_for_active_workspace();
                     }
                     // Pin note to corkboard
                     (true, false, KeyCode::Char('p')) => {
                         self.notes[idx].data.on_corkboard = true;
-                        self.focus = Focus::Shell;
+                        self.focus = self.focus_for_active_workspace();
                     }
                     // Assign note to a notebook
                     (true, false, KeyCode::Char('g')) => {
@@ -644,7 +566,7 @@ impl App {
                             }
                             None => {
                                 self.notebooks_open.remove(&open_nb_id);
-                                self.focus = Focus::Shell;
+                                self.focus = self.focus_for_active_workspace();
                             }
                         }
                     }
@@ -789,6 +711,23 @@ impl App {
                     (true, false, KeyCode::Char('y')) if matches!(note_type, NoteType::Shell) => {
                         self.snapshot_shell_note(idx);
                     }
+                    // Ctrl+Alt+I on shell notes: toggle PTY output logging.
+                    _ if matches!(note_type, NoteType::Shell) && cfg.toggle_log.matches(key) => {
+                        let logging = matches!(&self.notes[idx].kind,
+                            NoteKind::Shell { log_file, .. } if log_file.is_some());
+                        if logging {
+                            if let NoteKind::Shell { log_file, log_path, .. } =
+                                &mut self.notes[idx].kind
+                            {
+                                *log_file = None;
+                                *log_path = None;
+                            }
+                            self.focus = self.note_focus(idx);
+                        } else {
+                            let default = self.default_log_path(idx);
+                            self.focus = Focus::LoggingSetup(idx, default);
+                        }
+                    }
                     // Ctrl+B on shell notes: toggle background mode (fills workspace as background shell).
                     (true, false, KeyCode::Char('b')) if matches!(note_type, NoteType::Shell) => {
                         let was_bg = self.notes[idx].data.is_background;
@@ -819,7 +758,7 @@ impl App {
                             self.detach_from_notebook(idx);
                             let note = self.notes.remove(idx);
                             self.trash_note(note);
-                            self.focus = Focus::Shell;
+                            self.focus = self.focus_for_active_workspace();
                         }
                     }
                     // Tab: cycle to next text or checklist note.
@@ -999,44 +938,57 @@ impl App {
             },
 
             // ── Keyboard visual-block selection ─────────────────────────────
-            Focus::Selecting { anchor_col, anchor_row, cursor_col, cursor_row } => {
+            Focus::Selecting { anchor_col, anchor_row, cursor_col, cursor_row, from_bg_shell } => {
                 let (term_rows, term_cols) = (self.term_size.1, self.term_size.0);
+                // Clamp cursor within the shell area (excluding tab bar at top and hint bar at bottom).
+                let row_min = BG_SHELL_INSET;
+                let row_max = term_rows.saturating_sub(BG_SHELL_INSET + 1);
+                // Focus to restore when exiting screenshot mode.
+                let exit_focus = if let Some(idx) = from_bg_shell {
+                    Focus::BackgroundShell(idx)
+                } else {
+                    self.focus_for_active_workspace()
+                };
                 match key.code {
-                    KeyCode::Esc => { self.focus = Focus::Shell; }
+                    KeyCode::Esc => { self.focus = exit_focus; }
                     KeyCode::Enter | KeyCode::Char('y') => {
-                        self.create_photo_note(anchor_col, anchor_row, cursor_col, cursor_row);
-                        self.focus = Focus::Shell;
+                        self.create_photo_note(anchor_col, anchor_row, cursor_col, cursor_row, from_bg_shell);
+                        self.focus = exit_focus;
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
-                        self.copy_selection_to_clipboard(anchor_col, anchor_row, cursor_col, cursor_row);
-                        self.focus = Focus::Shell;
+                        self.copy_selection_to_clipboard(anchor_col, anchor_row, cursor_col, cursor_row, from_bg_shell);
+                        self.focus = exit_focus;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         self.focus = Focus::Selecting {
                             anchor_col, anchor_row, cursor_col,
-                            cursor_row: cursor_row.saturating_sub(1),
+                            cursor_row: cursor_row.saturating_sub(1).max(row_min),
+                            from_bg_shell,
                         };
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         self.focus = Focus::Selecting {
                             anchor_col, anchor_row, cursor_col,
-                            cursor_row: (cursor_row + 1).min(term_rows.saturating_sub(1)),
+                            cursor_row: (cursor_row + 1).min(row_max),
+                            from_bg_shell,
                         };
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
                         self.focus = Focus::Selecting {
                             anchor_col, anchor_row, cursor_row,
                             cursor_col: cursor_col.saturating_sub(1),
+                            from_bg_shell,
                         };
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
                         self.focus = Focus::Selecting {
                             anchor_col, anchor_row, cursor_row,
                             cursor_col: (cursor_col + 1).min(term_cols.saturating_sub(1)),
+                            from_bg_shell,
                         };
                     }
                     _ => {
-                        self.focus = Focus::Selecting { anchor_col, anchor_row, cursor_col, cursor_row };
+                        self.focus = Focus::Selecting { anchor_col, anchor_row, cursor_col, cursor_row, from_bg_shell };
                     }
                 }
             }
@@ -1143,9 +1095,9 @@ impl App {
                     if let Some(slot) = self.workspace_names.get_mut(self.active_workspace as usize) {
                         *slot = name;
                     }
-                    self.focus = Focus::Shell;
+                    self.focus = self.focus_for_active_workspace();
                 }
-                KeyCode::Esc => { self.focus = Focus::Shell; }
+                KeyCode::Esc => { self.focus = self.focus_for_active_workspace(); }
                 KeyCode::Backspace => {
                     input.pop();
                     self.focus = Focus::RenamingWorkspace(input);
@@ -1159,8 +1111,60 @@ impl App {
 
             // ── NamingNotebook (safety fallback) ────────────────────────────
             Focus::NamingNotebook(_, _) => {
-                self.focus = Focus::Shell;
+                self.focus = self.focus_for_active_workspace();
             }
+
+            // ── Logging setup ────────────────────────────────────────────────
+            Focus::LoggingSetup(idx, mut input) => match key.code {
+                KeyCode::Enter => {
+                    let path_str = if input.trim().is_empty() {
+                        self.default_log_path(idx)
+                    } else {
+                        input.clone()
+                    };
+                    let path = std::path::PathBuf::from(&path_str);
+                    // Ensure the logs directory exists.
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        Ok(file) => {
+                            if let NoteKind::Shell { log_file, log_path, .. } =
+                                &mut self.notes[idx].kind
+                            {
+                                *log_file = Some(std::io::BufWriter::new(file));
+                                *log_path = Some(path);
+                            }
+                        }
+                        Err(_) => {} // silently stay un-logged on file-open failure
+                    }
+                    self.focus = if self.notes[idx].data.is_background {
+                        Focus::BackgroundShell(idx)
+                    } else {
+                        self.note_focus(idx)
+                    };
+                }
+                KeyCode::Esc => {
+                    self.focus = if self.notes[idx].data.is_background {
+                        Focus::BackgroundShell(idx)
+                    } else {
+                        self.note_focus(idx)
+                    };
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    self.focus = Focus::LoggingSetup(idx, input);
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    self.focus = Focus::LoggingSetup(idx, input);
+                }
+                _ => { self.focus = Focus::LoggingSetup(idx, input); }
+            },
 
             // ── Rename mode ─────────────────────────────────────────────────
             Focus::Renaming(idx, mut input) => match key.code {
@@ -1191,18 +1195,14 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub(crate) fn handle_paste_event(&mut self, text: String) -> Result<()> {
-        enum Target { Background, BgShell(usize), TextNote(usize), ShellNote(usize), None }
+        enum Target { BgShell(usize), TextNote(usize), ShellNote(usize), None }
         let target = match &self.focus {
-            Focus::Shell                            => Target::Background,
             Focus::BackgroundShell(i)               => Target::BgShell(*i),
             Focus::Note(i, NoteType::Text)      => Target::TextNote(*i),
             Focus::Note(i, NoteType::Shell)     => Target::ShellNote(*i),
             _                                       => Target::None,
         };
         match target {
-            Target::Background => {
-                self.pty.write_bytes(text.as_bytes())?;
-            }
             Target::BgShell(idx) => {
                 if let NoteKind::Shell { pty, .. } = &mut self.notes[idx].kind {
                     pty.write_bytes(text.as_bytes())?;
@@ -1313,21 +1313,6 @@ impl App {
                     if !matches!(self.focus, Focus::Selecting { .. }) {
                         self.focus = Focus::BackgroundShell(bg_idx);
                     }
-                } else if self.parser.screen().alternate_screen() {
-                    self.forward_mouse_to_pty(event)?;
-                    if !matches!(self.focus, Focus::Selecting { .. }) {
-                        self.focus = Focus::Shell;
-                    }
-                } else {
-                    self.drag = Some(DragMode::Selecting {
-                        start_col: event.column,
-                        start_row: event.row,
-                        cur_col:   event.column,
-                        cur_row:   event.row,
-                    });
-                    if !matches!(self.focus, Focus::Selecting { .. }) {
-                        self.focus = Focus::Shell;
-                    }
                 }
             }
 
@@ -1365,11 +1350,6 @@ impl App {
                             self.forward_mouse_to_shell_note(idx, event)?;
                         }
                     }
-                } else if self.parser.screen().alternate_screen() {
-                    self.forward_mouse_to_pty(event)?;
-                    if !matches!(self.focus, Focus::Selecting { .. }) {
-                        self.focus = Focus::Shell;
-                    }
                 }
             }
 
@@ -1379,9 +1359,6 @@ impl App {
                 } else { None };
                 if let Some(nidx) = passthrough_idx {
                     self.forward_mouse_to_shell_note(nidx, event)?;
-                    if matches!(self.drag, None) && self.parser.screen().alternate_screen() {
-                        self.forward_mouse_to_pty(event)?;
-                    }
                     return Ok(());
                 }
                 match &mut self.drag {
@@ -1418,9 +1395,6 @@ impl App {
                     }
                     _ => {}
                 }
-                if matches!(self.drag, None) && self.parser.screen().alternate_screen() {
-                    self.forward_mouse_to_pty(event)?;
-                }
             }
 
             MouseEventKind::Drag(MouseButton::Right) => {
@@ -1434,8 +1408,6 @@ impl App {
                     note.data.width  = ((orig_w as i32 + dw).max(MIN_NOTE_W as i32)) as u16;
                     note.data.height = ((orig_h as i32 + dh).max(MIN_NOTE_H as i32)) as u16;
                     self.clamp_note(note_idx);
-                } else if self.parser.screen().alternate_screen() {
-                    self.forward_mouse_to_pty(event)?;
                 }
             }
 
@@ -1492,21 +1464,34 @@ impl App {
 
                 if let Some(DragMode::Selecting { start_col, start_row, cur_col, cur_row }) = self.drag {
                     self.drag = None;
-                    if matches!(self.focus, Focus::Selecting { .. }) {
+                    if let Focus::Selecting { from_bg_shell, .. } = self.focus {
                         if start_col != cur_col || start_row != cur_row {
-                            self.create_photo_note(start_col, start_row, cur_col, cur_row);
-                            self.focus = Focus::Shell;
+                            self.create_photo_note(start_col, start_row, cur_col, cur_row, from_bg_shell);
+                            self.focus = if let Some(idx) = from_bg_shell {
+                                Focus::BackgroundShell(idx)
+                            } else {
+                                self.focus_for_active_workspace()
+                            };
                         }
-                    } else if start_col != cur_col || start_row != cur_row {
-                        let (sc, sr, ec, er) = if start_row < cur_row
-                            || (start_row == cur_row && start_col <= cur_col)
-                        {
-                            (start_col, start_row, cur_col, cur_row)
-                        } else {
-                            (cur_col, cur_row, start_col, start_row)
-                        };
-                        self.copy_stream_selection(sc, sr, ec, er);
-                        self.text_selection = Some((sc, sr, ec, er));
+                    } else if let Focus::BackgroundShell(bg_idx) = self.focus {
+                        // Drag on the background shell note: copy as a stream selection.
+                        // Coordinates are screen-absolute; the bg note's parser rows
+                        // start at BG_SHELL_INSET so subtract that offset.
+                        if start_col != cur_col || start_row != cur_row {
+                            let (sc, sr, ec, er) = if start_row < cur_row
+                                || (start_row == cur_row && start_col <= cur_col)
+                            {
+                                (start_col, start_row, cur_col, cur_row)
+                            } else {
+                                (cur_col, cur_row, start_col, start_row)
+                            };
+                            self.copy_shell_note_stream_selection(
+                                bg_idx,
+                                sc, sr.saturating_sub(BG_SHELL_INSET),
+                                ec, er.saturating_sub(BG_SHELL_INSET),
+                            );
+                            self.text_selection = Some((sc, sr, ec, er));
+                        }
                     }
                     return Ok(());
                 }
@@ -1534,16 +1519,28 @@ impl App {
                     }
                 }
                 self.drag = None;
-                if !was_note_drag && self.parser.screen().alternate_screen() {
-                    self.forward_mouse_to_pty(event)?;
-                }
             }
 
             MouseEventKind::ScrollUp => {
-                if matches!(self.focus, Focus::Shell | Focus::Selecting { .. })
-                    && self.parser.screen().alternate_screen()
-                {
-                    self.forward_mouse_to_pty(event)?;
+                // Screenshot mode entered from a background shell note: scroll the bg
+                // note's history, not the main PTY.  Must be checked first so it doesn't
+                // fall into the generic `Focus::Selecting` arm below.
+                if let Focus::Selecting { from_bg_shell: Some(bg_idx), .. } = self.focus {
+                    let in_alt = if let NoteKind::Shell { parser, .. } = &self.notes[bg_idx].kind {
+                        parser.screen().alternate_screen()
+                    } else { false };
+                    if !in_alt {
+                        let scrolled = if let NoteKind::Shell { scroll_offset, own_scrollback, parser, .. } =
+                            &mut self.notes[bg_idx].kind
+                        {
+                            let max_scroll = (own_scrollback.len() as i64)
+                                .max(parser.screen().scrollback() as i64);
+                            let before = *scroll_offset;
+                            *scroll_offset = (*scroll_offset + 1).min(max_scroll);
+                            *scroll_offset != before
+                        } else { false };
+                        let _ = scrolled;
+                    }
                     return Ok(());
                 }
                 if let Focus::BackgroundShell(bg_idx) = self.focus {
@@ -1554,8 +1551,21 @@ impl App {
                         self.forward_mouse_to_shell_note(bg_idx, event)?;
                         return Ok(());
                     }
-                    if let NoteKind::Shell { scroll_offset, .. } = &mut self.notes[bg_idx].kind {
-                        *scroll_offset += 1;
+                    let scrolled = if let NoteKind::Shell { scroll_offset, own_scrollback, parser, .. } =
+                        &mut self.notes[bg_idx].kind
+                    {
+                        let max_scroll = (own_scrollback.len() as i64)
+                            .max(parser.screen().scrollback() as i64);
+                        let before = *scroll_offset;
+                        *scroll_offset = (*scroll_offset + 1).min(max_scroll);
+                        *scroll_offset != before
+                    } else { false };
+                    if scrolled {
+                        let term_rows = self.term_size.1 as u16;
+                        if let Some((_, ref mut sr, _, ref mut er)) = self.text_selection {
+                            *sr = (*sr + 1).min(term_rows - 1);
+                            *er = (*er + 1).min(term_rows - 1);
+                        }
                     }
                     self.focus = Focus::BackgroundShell(bg_idx);
                     return Ok(());
@@ -1570,28 +1580,24 @@ impl App {
                         return Ok(());
                     }
                 }
-                let scroll_before = self.scroll_offset;
                 match self.focus {
-                    Focus::Shell | Focus::Selecting { .. } => {
-                        if !self.parser.screen().alternate_screen() {
-                            let max_scroll = (self.own_scrollback.len() as i64)
-                                .max(self.parser.screen().scrollback() as i64);
-                            self.scroll_offset = (self.scroll_offset + 1).min(max_scroll);
-                            let term_rows = self.term_size.1 as u16;
-                            if let Some(DragMode::Selecting { start_row, cur_row, .. }) =
-                                &mut self.drag
-                            {
-                                *start_row = (*start_row + 1).min(term_rows - 1);
-                                *cur_row   = (*cur_row   + 1).min(term_rows - 1);
-                            }
-                        }
-                    }
                     Focus::Note(idx, NoteType::Shell) => {
-                        if let NoteKind::Shell { scroll_offset, parser, .. } =
+                        let scrolled = if let NoteKind::Shell { scroll_offset, parser, .. } =
                             &mut self.notes[idx].kind
                         {
                             if !parser.screen().alternate_screen() {
+                                let before = *scroll_offset;
                                 *scroll_offset += 1;
+                                *scroll_offset != before
+                            } else { false }
+                        } else { false };
+                        if scrolled {
+                            let term_rows = self.term_size.1 as u16;
+                            if let Some((sel_idx, _sc, sr, _ec, er)) = &mut self.shell_note_selection {
+                                if *sel_idx == idx {
+                                    *sr = (*sr + 1).min(term_rows - 1);
+                                    *er = (*er + 1).min(term_rows - 1);
+                                }
                             }
                         }
                     }
@@ -1604,24 +1610,30 @@ impl App {
                     }
                     _ => {}
                 }
-                if self.scroll_offset != scroll_before {
-                    let term_rows = self.term_size.1 as u16;
-                    if let Focus::Selecting { anchor_row, cursor_row, .. } = &mut self.focus {
-                        *anchor_row = (*anchor_row + 1).min(term_rows - 1);
-                        *cursor_row = (*cursor_row + 1).min(term_rows - 1);
-                    }
-                    if let Some((_, ref mut sr, _, ref mut er)) = self.text_selection {
-                        *sr = (*sr + 1).min(term_rows - 1);
-                        *er = (*er + 1).min(term_rows - 1);
-                    }
-                }
             }
 
             MouseEventKind::ScrollDown => {
-                if matches!(self.focus, Focus::Shell | Focus::Selecting { .. })
-                    && self.parser.screen().alternate_screen()
-                {
-                    self.forward_mouse_to_pty(event)?;
+                // Screenshot mode from a background shell note: scroll the bg note,
+                // not the main PTY.  Same early-exit pattern as ScrollUp above.
+                if let Focus::Selecting { from_bg_shell: Some(bg_idx), .. } = self.focus {
+                    let in_alt = if let NoteKind::Shell { parser, .. } = &self.notes[bg_idx].kind {
+                        parser.screen().alternate_screen()
+                    } else { false };
+                    if !in_alt {
+                        let scrolled = if let NoteKind::Shell { scroll_offset, rows, parser, .. } =
+                            &mut self.notes[bg_idx].kind
+                        {
+                            let min = if parser.screen().alternate_screen() {
+                                0
+                            } else {
+                                -(*rows as i64 - PROMPT_LINES)
+                            };
+                            let before = *scroll_offset;
+                            *scroll_offset = (*scroll_offset - 1).max(min);
+                            *scroll_offset != before
+                        } else { false };
+                        let _ = scrolled;
+                    }
                     return Ok(());
                 }
                 if let Focus::BackgroundShell(bg_idx) = self.focus {
@@ -1632,7 +1644,7 @@ impl App {
                         self.forward_mouse_to_shell_note(bg_idx, event)?;
                         return Ok(());
                     }
-                    if let NoteKind::Shell { scroll_offset, rows, parser, .. } =
+                    let scrolled = if let NoteKind::Shell { scroll_offset, rows, parser, .. } =
                         &mut self.notes[bg_idx].kind
                     {
                         let min = if parser.screen().alternate_screen() {
@@ -1640,7 +1652,15 @@ impl App {
                         } else {
                             -(*rows as i64 - PROMPT_LINES)
                         };
+                        let before = *scroll_offset;
                         *scroll_offset = (*scroll_offset - 1).max(min);
+                        *scroll_offset != before
+                    } else { false };
+                    if scrolled {
+                        if let Some((_, ref mut sr, _, ref mut er)) = self.text_selection {
+                            *sr = sr.saturating_sub(1).max(BG_SHELL_INSET);
+                            *er = er.saturating_sub(1).max(BG_SHELL_INSET);
+                        }
                     }
                     self.focus = Focus::BackgroundShell(bg_idx);
                     return Ok(());
@@ -1655,20 +1675,9 @@ impl App {
                         return Ok(());
                     }
                 }
-                let scroll_before = self.scroll_offset;
                 match self.focus {
-                    Focus::Shell | Focus::Selecting { .. } => {
-                        let min = -(self.term_size.1 as i64 - PROMPT_LINES);
-                        self.scroll_offset = (self.scroll_offset - 1).max(min);
-                        if let Some(DragMode::Selecting { start_row, cur_row, .. }) =
-                            &mut self.drag
-                        {
-                            *start_row = start_row.saturating_sub(1);
-                            *cur_row   = cur_row.saturating_sub(1);
-                        }
-                    }
                     Focus::Note(idx, NoteType::Shell) => {
-                        if let NoteKind::Shell { scroll_offset, rows, parser, .. } =
+                        let scrolled = if let NoteKind::Shell { scroll_offset, rows, parser, .. } =
                             &mut self.notes[idx].kind
                         {
                             let min = if parser.screen().alternate_screen() {
@@ -1676,7 +1685,18 @@ impl App {
                             } else {
                                 -(*rows as i64 - PROMPT_LINES)
                             };
+                            let before = *scroll_offset;
                             *scroll_offset = (*scroll_offset - 1).max(min);
+                            *scroll_offset != before
+                        } else { false };
+                        if scrolled {
+                            let inner_y = self.notes[idx].data.y + 1;
+                            if let Some((sel_idx, _sc, sr, _ec, er)) = &mut self.shell_note_selection {
+                                if *sel_idx == idx {
+                                    *sr = sr.saturating_sub(1).max(inner_y);
+                                    *er = er.saturating_sub(1).max(inner_y);
+                                }
+                            }
                         }
                     }
                     Focus::Note(idx, NoteType::Text) | Focus::Note(idx, NoteType::CheckList) => {
@@ -1688,49 +1708,11 @@ impl App {
                     }
                     _ => {}
                 }
-                if self.scroll_offset != scroll_before {
-                    if let Focus::Selecting { anchor_row, cursor_row, .. } = &mut self.focus {
-                        *anchor_row = anchor_row.saturating_sub(1);
-                        *cursor_row = cursor_row.saturating_sub(1);
-                    }
-                    if let Some((_, ref mut sr, _, ref mut er)) = self.text_selection {
-                        *sr = sr.saturating_sub(1);
-                        *er = er.saturating_sub(1);
-                    }
-                }
             }
 
             _ => {}
         }
 
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Mouse forwarding to background PTY
-    // -----------------------------------------------------------------------
-
-    fn forward_mouse_to_pty(&mut self, event: MouseEvent) -> Result<()> {
-        let (mut btn, is_release): (u16, bool) = match event.kind {
-            MouseEventKind::Down(MouseButton::Left)   => (0, false),
-            MouseEventKind::Down(MouseButton::Middle) => (1, false),
-            MouseEventKind::Down(MouseButton::Right)  => (2, false),
-            MouseEventKind::Up(MouseButton::Left)     => (0, true),
-            MouseEventKind::Up(MouseButton::Middle)   => (1, true),
-            MouseEventKind::Up(MouseButton::Right)    => (2, true),
-            MouseEventKind::Drag(MouseButton::Left)   => (32, false),
-            MouseEventKind::Drag(MouseButton::Middle) => (33, false),
-            MouseEventKind::Drag(MouseButton::Right)  => (34, false),
-            MouseEventKind::ScrollUp                  => (64, false),
-            MouseEventKind::ScrollDown                => (65, false),
-            _ => return Ok(()),
-        };
-        if event.modifiers.contains(KeyModifiers::SHIFT)   { btn |= 4; }
-        if event.modifiers.contains(KeyModifiers::ALT)     { btn |= 8; }
-        if event.modifiers.contains(KeyModifiers::CONTROL) { btn |= 16; }
-        let suffix = if is_release { 'm' } else { 'M' };
-        let seq = format!("\x1b[<{btn};{};{}{suffix}", event.column + 1, event.row + 1);
-        self.pty.write_bytes(seq.as_bytes())?;
         Ok(())
     }
 
@@ -1769,10 +1751,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub(crate) fn handle_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        let shell_rows = rows.saturating_sub(2 * BG_SHELL_INSET);
-        self.pty.resize(shell_rows, cols)?;
-        self.parser.set_size(shell_rows, cols);
-
+        let _ = (cols, rows); // term_size is already updated in the event handler
         // Clamp every note so none end up stranded off-screen after a resize.
         for i in 0..self.notes.len() {
             self.clamp_note(i);
@@ -1824,7 +1803,7 @@ impl App {
                         if selected < self.notebooks.len() {
                             let nb_id = self.notebooks[selected].id;
                             self.assign_to_notebook(note_idx, nb_id);
-                            self.focus = Focus::Shell;
+                            self.focus = self.focus_for_active_workspace();
                         }
                     }
                     NotebookPickerMode::AddToNotebook(nb_id) => {

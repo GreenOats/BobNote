@@ -31,12 +31,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     // --- Background: fill with detected app colour so empty cells match the theme ---
-    // Use the background note's detected colour when one is active.
     let bg_fill_color: Option<Color> = if let Some(bg_idx) = app.background_note_idx() {
         if let NoteKind::Shell { detected_bg, .. } = &app.notes[bg_idx].kind {
             *detected_bg
-        } else { app.detected_bg }
-    } else { app.detected_bg };
+        } else { None }
+    } else { None };
 
     if let Some(bg) = bg_fill_color {
         frame.render_widget(
@@ -56,7 +55,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         area.height.saturating_sub(2 * BG_SHELL_INSET),
     );
 
-    // When the active workspace has a background shell note, render it instead of App.pty.
+    // Render the active workspace's background shell note.
     if let Some(bg_idx) = app.background_note_idx() {
         if let NoteKind::Shell { parser, scroll_offset, own_scrollback, .. } =
             &app.notes[bg_idx].kind
@@ -83,35 +82,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 frame.render_widget(PtyView(parser.screen(), row_offset), shell_area);
             }
         }
-    } else {
-        // Mirrors the shell-note split-render logic:
-        //   scroll_offset > 0  →  history (own_scrollback rows on top, PtyView below)
-        //   scroll_offset = 0  →  live view
-        //   scroll_offset < 0  →  blank rows below prompt (Alacritty-style)
-        let vt100_depth = app.parser.screen().scrollback() as i64;
-        let own_sb_rows_needed = (app.scroll_offset - vt100_depth).max(0);
-
-        if own_sb_rows_needed > 0 && !app.own_scrollback.is_empty() {
-            let own_sb_rows = own_sb_rows_needed
-                .min(app.own_scrollback.len() as i64)
-                .min(shell_area.height as i64) as u16;
-            let top_idx = app.own_scrollback
-                .len()
-                .saturating_sub(app.scroll_offset as usize);
-            let own_sb_area = Rect::new(shell_area.x, shell_area.y, shell_area.width, own_sb_rows);
-            frame.render_widget(
-                OwnScrollbackView { rows: &app.own_scrollback, top_idx },
-                own_sb_area,
-            );
-            let pty_rows = shell_area.height.saturating_sub(own_sb_rows);
-            if pty_rows > 0 {
-                let pty_area = Rect::new(shell_area.x, shell_area.y + own_sb_rows, shell_area.width, pty_rows);
-                frame.render_widget(PtyView(app.parser.screen(), 0), pty_area);
-            }
-        } else {
-            let row_offset = app.scroll_offset.min(0).unsigned_abs() as usize;
-            frame.render_widget(PtyView(app.parser.screen(), row_offset), shell_area);
-        }
     }
 
     // --- Selection overlay ---
@@ -121,7 +91,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             (Some(DragMode::Selecting { start_col, start_row, cur_col, cur_row }),
              Focus::Selecting { .. }) =>
                 Some((*start_col, *start_row, *cur_col, *cur_row)),
-            (_, Focus::Selecting { anchor_col, anchor_row, cursor_col, cursor_row }) =>
+            (_, Focus::Selecting { anchor_col, anchor_row, cursor_col, cursor_row, .. }) =>
                 Some((*anchor_col, *anchor_row, *cursor_col, *cursor_row)),
             _ => None,
         };
@@ -264,18 +234,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         cursor_set = true;
     }
 
-    if !cursor_set && app.scroll_offset <= 0 {
-        let row_offset = app.scroll_offset.min(0).unsigned_abs() as usize;
-        let (crow, ccol) = app.parser.screen().cursor_position();
-        if crow as usize >= row_offset {
-            let visible_row = (crow as usize - row_offset) as u16;
-            frame.set_cursor_position((shell_area.x + ccol, shell_area.y + visible_row));
-        }
-    }
-
     // --- Settings popup ---
     if matches!(app.focus, Focus::Settings(_, _)) {
         overlays::render_settings_popup(frame, app, area);
+    }
+
+    // --- Logging setup popup ---
+    if matches!(app.focus, Focus::LoggingSetup(_, _)) {
+        overlays::render_logging_popup(frame, app, area);
     }
 
     // --- Notebook picker overlay ---

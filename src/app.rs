@@ -5,8 +5,7 @@ use crate::{
     constants::{BG_SHELL_INSET, CARD_H, CARD_W, PROMPT_LINES},
     note::{self, Note, NoteKind, PhotoCell, PhotoRow, SerColor},
     notebook::{self, NotebookData},
-    pty::PtySession,
-    terminal::{CapturedRow, capture_region, capture_screen_before_resize, capture_scrollback_rows, map_color},
+    terminal::{capture_region, capture_rendered_region, capture_screen_before_resize, capture_scrollback_rows, map_color},
     ui,
     workspace,
 };
@@ -14,7 +13,7 @@ use anyhow::Result;
 use ratatui::style::Color;
 use crossterm::event::{self, Event};
 use ratatui::{Terminal, backend::Backend};
-use std::{collections::{HashMap, VecDeque}, time::{Duration, Instant}};
+use std::{collections::HashMap, io::Write, time::{Duration, Instant}};
 
 /// How the occlusion-dim effect treats text colour on dimmed (behind) notes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,7 +72,6 @@ pub enum SettingsSection {
 
 /// What currently has keyboard focus.
 pub enum Focus {
-    Shell,
     /// A background shell note for the active workspace has focus.
     /// The `usize` is the index into `App::notes`.
     BackgroundShell(usize),
@@ -87,11 +85,18 @@ pub enum Focus {
     RenamingWorkspace(String),
     /// Typing the title for a new notebook (id, live input buffer).
     NamingNotebook(u64, String),
+    /// Shell log-file path input popup.
+    /// `usize` = note index, `String` = live path input buffer.
+    LoggingSetup(usize, String),
     /// Keyboard visual-block selection mode (vim Ctrl+V style).
     /// `anchor` is the fixed corner, `cursor` is the moving corner.
+    /// `from_bg_shell` is `Some(idx)` when screenshot mode was entered while a
+    /// background shell note was active — used to capture from the right parser
+    /// and to restore `BackgroundShell` focus on exit.
     Selecting {
         anchor_col: u16, anchor_row: u16,
         cursor_col: u16, cursor_row: u16,
+        from_bg_shell: Option<usize>,
     },
     /// Keyboard visual-selection mode inside a text note (entered via Ctrl+V).
     /// `anchor_row/col` mark where selection started (buffer coordinates).
@@ -155,9 +160,6 @@ pub enum DragMode {
 pub struct App {
     /// User key-binding configuration loaded from `~/.bobrc`.
     pub config: Config,
-    pub pty: PtySession,
-    /// vt100 parser — maintains the full virtual terminal grid from PTY output.
-    pub parser: vt100::Parser,
     pub notes: Vec<Note>,
     pub focus: Focus,
     pub drag: Option<DragMode>,
@@ -170,16 +172,6 @@ pub struct App {
     /// When `Some(idx)`, a shell note is expanded full-screen inside the corkboard.
     /// `idx` is the index into `App::notes`.
     pub corkboard_expanded: Option<usize>,
-    /// Foreground application currently running in the main background terminal (None = shell).
-    pub active_app: Option<String>,
-    /// Background colour sampled from the main terminal while an app is active.
-    /// Cleared when the foreground process returns to the shell.
-    pub detected_bg: Option<Color>,
-    /// Scroll position for the main background terminal (i64, matches shell-note semantics):
-    ///   > 0  →  scrolled up into history
-    ///   = 0  →  live view (prompt at bottom)
-    ///   < 0  →  scrolled down past live view (blank rows below prompt, Alacritty-style)
-    pub scroll_offset: i64,
     /// Show the splash screen until the first keypress.
     pub splash: bool,
     /// Whether the hint bar at the bottom is visible (toggled with Alt+H).
@@ -188,13 +180,6 @@ pub struct App {
     pub show_shadows: bool,
     /// Occlusion-dim mode, cycled with Ctrl+O.
     pub occlusion_dim: OcclusionDim,
-    /// Captured scrollback lines for the main background terminal.
-    /// Holds rows that have scrolled past vt100's accessible window (capped to
-    /// the parser's visible row count by the vt100 API).
-    pub own_scrollback: VecDeque<CapturedRow>,
-    /// Fingerprints of the previously accessible vt100 scrollback rows for the
-    /// main terminal — used by `capture_scrollback_rows` each frame.
-    pub sb_prev_fps: Vec<u64>,
     /// Cached terminal dimensions — refreshed only on resize events to avoid
     /// a syscall every frame.
     pub term_size: (u16, u16),
@@ -314,37 +299,53 @@ fn sample_bg_color(parser: &vt100::Parser) -> Option<Color> {
 impl App {
     pub fn new() -> Result<Self> {
         let (cols, rows) = crossterm::terminal::size()?;
-        // Load config first so shell_scrollback is available for note/parser creation.
+        // Load config first so shell_scrollback is available for note creation.
         let config = Config::load();
 
-        // The main PTY is inset by BG_SHELL_INSET rows on each side so the
-        // workspace tab bar (top) and hint bar (bottom) are never obscured.
-        let shell_rows = rows.saturating_sub(2 * BG_SHELL_INSET);
-
-        let pty = PtySession::new(shell_rows, cols, None)?;
-        // 10 000-line scrollback for the main terminal.
-        let parser = vt100::Parser::new(shell_rows, cols, 10_000);
-
         // Load any previously saved notes and notebooks from disk.
-        let notes = note::load_notes(config.shell_scrollback).unwrap_or_default();
+        let mut notes = note::load_notes(config.shell_scrollback).unwrap_or_default();
         let notebooks = notebook::load_notebooks().unwrap_or_default();
         let trash = trash::load_trash();
         // If a crash left a note in both the active notes dir and the trash dir,
         // trust the trash version and drop it from the active list.
         let trash_ids: std::collections::HashSet<u64> =
             trash.iter().map(|t| t.data.id).collect();
-        let notes: Vec<_> = notes.into_iter().filter(|n| !trash_ids.contains(&n.data.id)).collect();
+        notes.retain(|n| !trash_ids.contains(&n.data.id));
         // Re-derive next_id after filtering.
-        let next_id = notes.iter().map(|n| n.data.id + 1).max()
+        let mut next_id = notes.iter().map(|n| n.data.id + 1).max()
             .unwrap_or(1)
             .max(trash.iter().map(|t| t.data.id + 1).max().unwrap_or(1));
         let next_notebook_id = notebooks.iter().map(|nb| nb.id + 1).max().unwrap_or(1);
+
+        let (workspace_count, workspace_names) = workspace::load_workspaces();
+
+        // Ensure every workspace has exactly one background shell note.
+        // This handles first-run and migration from the old single-PTY model.
+        let shell_rows = rows.saturating_sub(2 * BG_SHELL_INSET);
+        for ws in 0..workspace_count {
+            let has_bg = notes.iter().any(|n| {
+                n.data.is_shell && n.data.is_background && n.data.workspace_id == ws
+            });
+            if !has_bg {
+                let id = next_id;
+                next_id += 1;
+                let mut note = Note::new_shell(id, 0, BG_SHELL_INSET, cols, shell_rows, config.shell_scrollback)?;
+                note.data.workspace_id = ws;
+                note.data.is_background = true;
+                note.data.show_border = false;
+                notes.push(note);
+            }
+        }
 
         // Restore book-mode session from the last run (if any).
         // Validate that each notebook and page still exist before trusting the session.
         let (notebooks_open, initial_focus) = {
             let mut map: HashMap<u64, usize> = HashMap::new();
-            let mut focus = Focus::Shell;
+            // Default focus: the background shell note for workspace 0.
+            let bg_idx_ws0 = notes.iter().position(|n| {
+                n.data.is_shell && n.data.is_background && n.data.workspace_id == 0
+            }).expect("workspace 0 background note must exist");
+            let mut focus = Focus::BackgroundShell(bg_idx_ws0);
             for (nb_id, page_idx) in notebook::load_session() {
                 let valid = notebooks.iter()
                     .find(|nb| nb.id == nb_id)
@@ -368,24 +369,8 @@ impl App {
             (map, focus)
         };
 
-        let (workspace_count, workspace_names) = workspace::load_workspaces();
-
-        // Determine initial focus: if there's a background note for workspace 0
-        // and no notebook session restored a note focus, switch to BackgroundShell.
-        let initial_focus = {
-            let bg_idx = notes.iter().position(|n| {
-                n.data.is_shell && n.data.is_background && n.data.workspace_id == 0
-            });
-            match (initial_focus, bg_idx) {
-                (Focus::Shell, Some(idx)) => Focus::BackgroundShell(idx),
-                (f, _) => f,
-            }
-        };
-
         Ok(Self {
             config,
-            pty,
-            parser,
             notes,
             focus: initial_focus,
             drag: None,
@@ -394,15 +379,10 @@ impl App {
             corkboard_open: false,
             corkboard_selected: 0,
             corkboard_expanded: None,
-            active_app: None,
-            detected_bg: None,
-            scroll_offset: 0,
             splash: true,
             show_hints: true,
             show_shadows: false,
             occlusion_dim: OcclusionDim::BlackText,
-            own_scrollback: VecDeque::new(),
-            sb_prev_fps: Vec::new(),
             term_size: (cols, rows),
             clipboard: arboard::Clipboard::new().ok(),
             text_selection: None,
@@ -433,80 +413,6 @@ impl App {
             let frame_start = Instant::now();
             let mut dirty = false;
             self.frame_count = self.frame_count.wrapping_add(1);
-
-            // Drain main PTY output into the parser, capturing scrollback after
-            // every small chunk.  vt100's scrollback peek is capped to `shell_rows`
-            // lines per call, so if we drain all pending bytes in one go and then
-            // capture, any burst longer than ~shell_rows lines loses the oldest rows.
-            // Processing in ≤512-byte chunks (~6 lines) keeps each capture window
-            // well within the vt100 limit.
-            // The main PTY is inset; derive its actual row count from the vt100 parser
-            // (set at startup and updated by handle_resize, not from term_size directly).
-            let shell_rows = self.parser.screen().size().0;
-            let mut main_new_lines: i64 = 0;
-            while let Ok(bytes) = self.pty.output.try_recv() {
-                dirty = true;
-                for chunk in bytes.chunks(512) {
-                    // When `clear` (or `reset`) is run, wipe the scrollback buffer so
-                    // the user cannot scroll back into history that has been cleared.
-                    // The alternate-screen guard inside is_clear_screen_output prevents
-                    // this from firing when a TUI app (nvim, htop …) is starting up.
-                    if !self.parser.screen().alternate_screen()
-                        && is_clear_screen_output(chunk)
-                    {
-                        self.own_scrollback.clear();
-                        self.sb_prev_fps.clear();
-                        self.scroll_offset = 0;
-                    }
-                    self.parser.process(chunk);
-                    let (_, n) = capture_scrollback_rows(
-                        &mut self.parser,
-                        &mut self.own_scrollback,
-                        &mut self.sb_prev_fps,
-                        shell_rows,
-                        10_000,
-                    );
-                    main_new_lines += n as i64;
-                }
-            }
-
-            // Final capture: idempotent, returns current depth for scroll-cap below.
-            let (vt100_depth_main, final_n) = capture_scrollback_rows(
-                &mut self.parser,
-                &mut self.own_scrollback,
-                &mut self.sb_prev_fps,
-                shell_rows,
-                10_000,
-            );
-            main_new_lines += final_n as i64;
-
-            // Alacritty-style fill: advance negative scroll_offset as output scrolls in,
-            // so output appears to flow into the blank space below the prompt.
-            if self.scroll_offset < 0 && main_new_lines > 0 {
-                self.scroll_offset = (self.scroll_offset + main_new_lines).min(0);
-            }
-
-            // Apply scroll offset to the main background terminal.
-            // vt100 overflow guard: visible_rows() does `rows_len - scrollback_offset`
-            // as usize — panics when offset > rows_len.  Cap what we hand to vt100;
-            // deeper history is served by own_scrollback in the renderer.
-            let term_rows_i = shell_rows as i64;
-            let main_vt100_off = self.scroll_offset.clamp(0, term_rows_i) as usize;
-            self.parser.set_scrollback(main_vt100_off);
-            let main_actual = self.parser.screen().scrollback() as i64;
-
-            // own_scrollback and vt100 scrollback overlap: rows are captured into
-            // own_scrollback as they enter vt100's window and stay there for up to
-            // max_safe frames.  The reachable depth is therefore max(L, D), not L+D.
-            let main_max = (self.own_scrollback.len() as i64).max(vt100_depth_main as i64);
-            if self.scroll_offset > main_max {
-                self.scroll_offset = main_max;
-            } else if self.scroll_offset <= term_rows_i && self.own_scrollback.is_empty()
-                && main_actual < self.scroll_offset
-            {
-                // In vt100 territory with no own_scrollback: sync down if buffer isn't full.
-                self.scroll_offset = main_actual;
-            }
 
             // Drain shell-note PTYs; resize their parser if the note was resized.
             // During a resize drag we update the parser size for correct rendering but
@@ -569,7 +475,7 @@ impl App {
             for (note_vec_idx, note) in self.notes.iter_mut().enumerate() {
                 if let NoteKind::Shell {
                     pty, parser, rows, cols, scroll_offset, own_scrollback, sb_prev_fps,
-                    startup_clear_pending, ..
+                    startup_clear_pending, log_file, ..
                 } = &mut note.kind
                 {
                     // Background notes have no border — PTY size = full note dimensions.
@@ -604,6 +510,10 @@ impl App {
                     while let Ok(bytes) = pty.output.try_recv() {
                         dirty = true;
                         note_received_output = true;
+                        // Write raw PTY bytes to the log file when logging is active.
+                        if let Some(ref mut lf) = log_file {
+                            let _ = lf.write_all(&bytes);
+                        }
                         for chunk in bytes.chunks(512) {
                             if !parser.screen().alternate_screen()
                                 && is_clear_screen_output(chunk)
@@ -622,6 +532,11 @@ impl App {
                             );
                             new_lines += n as i64;
                         }
+                    }
+
+                    // Flush log once per frame (after draining all pending output).
+                    if let Some(ref mut lf) = log_file {
+                        let _ = lf.flush();
                     }
 
                     // For restored shell notes: wipe the visible screen every frame that
@@ -739,28 +654,6 @@ impl App {
                 }
             }
 
-            // Same detection for the main background terminal.
-            if check_fg {
-                if let Some(pid) = self.pty.shell_pid {
-                    let new_app = foreground_app(pid);
-                    if new_app != self.active_app {
-                        if new_app.is_none() {
-                            self.detected_bg = None;
-                        }
-                        self.active_app = new_app;
-                    }
-                    if self.active_app.is_some() {
-                        if let Some(color) = sample_bg_color(&self.parser) {
-                            self.detected_bg = Some(color);
-                        }
-                    }
-                }
-            }
-            // Snap to the live view whenever a TUI app owns the alternate screen.
-            if self.parser.screen().alternate_screen() {
-                self.scroll_offset = 0;
-            }
-
             // Poll for input events before drawing so the same frame that receives
             // an event also renders the updated state (lower latency).
             let elapsed = frame_start.elapsed();
@@ -876,10 +769,25 @@ impl App {
         idx
     }
 
-    /// Copy the text content of a rectangular region of the background terminal
-    /// to the system clipboard. Coordinates are in terminal cell space (col, row).
-    pub(crate) fn copy_selection_to_clipboard(&mut self, col1: u16, row1: u16, col2: u16, row2: u16) {
-        let rows = capture_region(self.parser.screen(), col1, row1, col2, row2);
+    /// Copy the text content of a rectangular region of the terminal to the
+    /// system clipboard.  `source_note_idx` selects the parser the same way as
+    /// `create_photo_note`: `Some(idx)` → shell note's parser, `None` → main PTY.
+    pub(crate) fn copy_selection_to_clipboard(&mut self, col1: u16, row1: u16, col2: u16, row2: u16, source_note_idx: Option<usize>) {
+        // row1/row2 arrive as screen-absolute (include BG_SHELL_INSET); convert to
+        // shell-area-relative so capture_rendered_region maps them to parser rows.
+        let pr1 = row1.saturating_sub(BG_SHELL_INSET);
+        let pr2 = row2.saturating_sub(BG_SHELL_INSET);
+        // Resolve None → active workspace's background note.
+        let idx = source_note_idx.or_else(|| self.background_note_idx());
+        let rows = if let Some(idx) = idx {
+            if let NoteKind::Shell { parser, scroll_offset, own_scrollback, .. } = &self.notes[idx].kind {
+                capture_rendered_region(parser, *scroll_offset, own_scrollback, pr1, col1, pr2, col2)
+            } else {
+                return;
+            }
+        } else {
+            return;
+        };
         let text: String = rows
             .iter()
             .map(|row| {
@@ -898,47 +806,6 @@ impl App {
         }
     }
 
-    /// Copy a stream (text-flow) selection to the clipboard.
-    /// Coordinates must already be in text order: (sc, sr) ≤ (ec, er).
-    ///   - First row : cells sc ..= term_width
-    ///   - Middle rows: full lines
-    ///   - Last row  : cells 0 ..= ec
-    ///   - Single row: cells sc ..= ec
-    pub(crate) fn copy_stream_selection(&mut self, sc: u16, sr: u16, ec: u16, er: u16) {
-        let term_cols = self.term_size.0 as usize;
-        let rows = capture_region(
-            self.parser.screen(),
-            0, sr,
-            (term_cols as u16).saturating_sub(1), er,
-        );
-        let mut lines: Vec<String> = rows.iter().enumerate().map(|(i, row)| {
-            let (from, to) = if sr == er {
-                (sc as usize, (ec as usize + 1).min(row.len()))
-            } else if i == 0 {
-                (sc as usize, row.len())
-            } else if i == rows.len() - 1 {
-                (0, (ec as usize + 1).min(row.len()))
-            } else {
-                (0, row.len())
-            };
-            let s: String = row[from.min(row.len())..to.min(row.len())]
-                .iter()
-                .map(|cell| if cell.sym.is_empty() { " " } else { cell.sym.as_str() })
-                .collect();
-            s.trim_end().to_string()
-        }).collect();
-        // Drop trailing blank lines produced by empty terminal rows.
-        while lines.last().map_or(false, |l: &String| l.is_empty()) {
-            lines.pop();
-        }
-        let text = lines.join("\n");
-        if !text.is_empty() {
-            if let Some(ref mut cb) = self.clipboard {
-                let _ = cb.set_text(text);
-            }
-        }
-    }
-
     /// Copy a stream selection from a shell note's visible content to the clipboard.
     /// `sc/sr/ec/er` are **content-relative** (0-based inside the note's inner area),
     /// already in text order (start_row ≤ end_row).
@@ -948,12 +815,20 @@ impl App {
         sc: u16, sr: u16,
         ec: u16, er: u16,
     ) {
-        let note_inner_w = self.notes[note_idx].data.width.saturating_sub(2);
-        if let NoteKind::Shell { parser, .. } = &self.notes[note_idx].kind {
-            let rows = capture_region(
-                parser.screen(),
-                0, sr,
-                note_inner_w.saturating_sub(1), er,
+        // Background notes have no border: their parser width equals the note's full width.
+        let note_inner_w = if self.notes[note_idx].data.is_background {
+            self.notes[note_idx].data.width
+        } else {
+            self.notes[note_idx].data.width.saturating_sub(2)
+        };
+        // Extract scroll state before the long borrow of self.notes.
+        let text = if let NoteKind::Shell { parser, scroll_offset, own_scrollback, .. } =
+            &self.notes[note_idx].kind
+        {
+            let rows = capture_rendered_region(
+                parser, *scroll_offset, own_scrollback,
+                sr, 0,
+                er, note_inner_w.saturating_sub(1),
             );
             let mut lines: Vec<String> = rows.iter().enumerate().map(|(i, row)| {
                 let (from, to) = if sr == er {
@@ -974,11 +849,14 @@ impl App {
             while lines.last().map_or(false, |l: &String| l.is_empty()) {
                 lines.pop();
             }
-            let text = lines.join("\n");
-            if !text.is_empty() {
-                if let Some(ref mut cb) = self.clipboard {
-                    let _ = cb.set_text(text);
-                }
+            let t = lines.join("\n");
+            if t.is_empty() { None } else { Some(t) }
+        } else {
+            None
+        };
+        if let Some(text) = text {
+            if let Some(ref mut cb) = self.clipboard {
+                let _ = cb.set_text(text);
             }
         }
     }
@@ -1072,17 +950,35 @@ impl App {
         }
     }
 
-    /// Capture a rectangular region of the background terminal and create a
-    /// Photo note positioned exactly over the captured area.
-    pub(crate) fn create_photo_note(&mut self, col1: u16, row1: u16, col2: u16, row2: u16) {
+    /// Capture a rectangular region of the terminal and create a Photo note
+    /// positioned exactly over the captured area.  When `source_note_idx` is
+    /// `Some(idx)` the cells are read from that shell note's vt100 parser
+    /// (used when screenshot mode was entered from a background shell note);
+    /// `None` captures from the main background PTY.
+    pub(crate) fn create_photo_note(&mut self, col1: u16, row1: u16, col2: u16, row2: u16, source_note_idx: Option<usize>) {
         let c1 = col1.min(col2);
         let c2 = col1.max(col2);
         let r1 = row1.min(row2);
         let r2 = row1.max(row2);
         if c1 == c2 && r1 == r2 { return; } // single cell — ignore
 
-        // Capture the live vt100 screen (scroll_offset was snapped to 0 on entry).
-        let rows = capture_region(self.parser.screen(), c1, r1, c2, r2);
+        // Capture from the appropriate parser.
+        // Background notes sit at y = BG_SHELL_INSET; their parser rows are 0-based
+        // from that top edge, so subtract the inset to convert screen-absolute rows.
+        let row_off = BG_SHELL_INSET;
+        let pr1 = r1.saturating_sub(row_off);
+        let pr2 = r2.saturating_sub(row_off);
+        // Resolve None → active workspace's background note.
+        let idx = source_note_idx.or_else(|| self.background_note_idx());
+        let rows = if let Some(idx) = idx {
+            if let NoteKind::Shell { parser, scroll_offset, own_scrollback, .. } = &self.notes[idx].kind {
+                capture_rendered_region(parser, *scroll_offset, own_scrollback, pr1, c1, pr2, c2)
+            } else {
+                return;
+            }
+        } else {
+            return;
+        };
 
         // Also copy the captured region as plain text to the system clipboard so the
         // user can paste the content immediately without opening the photo note.
@@ -1417,6 +1313,8 @@ impl App {
                 d.y = y;
                 d.width = w;
                 d.height = h;
+                // Keep the whole notebook on the same workspace as the outgoing page.
+                d.workspace_id = self.active_workspace;
             }
             self.notebooks_open.insert(nb_id, new_page);
             let note_idx = self.bring_to_front(note_idx);
@@ -1439,6 +1337,29 @@ impl App {
         self.notes[note_idx].data.on_corkboard = false;
     }
 
+    // ── Logging helpers ─────────────────────────────────────────────────────
+
+    /// Build the default log file path for a shell note:
+    /// `~/.local/share/bobnote/logs/<safe_title>_<id>_<timestamp>.log`
+    pub(crate) fn default_log_path(&self, note_idx: usize) -> String {
+        let title = &self.notes[note_idx].data.title;
+        let id = self.notes[note_idx].data.id;
+        let safe: String = title.chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let base = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("bobnote")
+            .join("logs");
+        base.join(format!("{safe}_{id}_{ts}.log"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
     // ── Workspace helpers ───────────────────────────────────────────────────
 
     /// Return the index of the background shell note for the active workspace, if any.
@@ -1448,14 +1369,25 @@ impl App {
         })
     }
 
-    /// Return the appropriate shell focus for the active workspace:
-    /// `Focus::BackgroundShell(idx)` when a background note exists, else `Focus::Shell`.
+    /// Return the `Focus::BackgroundShell` for the active workspace.
+    /// Panics if the invariant is broken (every workspace must have a background note).
     pub(crate) fn focus_for_active_workspace(&self) -> Focus {
+        let idx = self.background_note_idx()
+            .expect("every workspace must have a background shell note");
+        Focus::BackgroundShell(idx)
+    }
+
+    /// Ensure the active workspace has a background shell note, creating one if
+    /// missing.  Returns the note index.  Panics if the PTY cannot be spawned.
+    pub(crate) fn ensure_background_note(&mut self) -> usize {
         if let Some(idx) = self.background_note_idx() {
-            Focus::BackgroundShell(idx)
-        } else {
-            Focus::Shell
+            return idx;
         }
+        let idx = self.new_shell_note()
+            .expect("failed to spawn background shell PTY");
+        self.notes[idx].data.is_background = true;
+        self.notes[idx].data.show_border = false;
+        idx
     }
 
     /// Switch to workspace `ws`, cancelling any drag and resetting focus.
@@ -1463,6 +1395,7 @@ impl App {
         if ws >= self.workspace_count { return; }
         self.active_workspace = ws;
         self.drag = None;
+        self.ensure_background_note();
         self.focus = self.focus_for_active_workspace();
     }
 

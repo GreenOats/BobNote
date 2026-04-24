@@ -236,17 +236,20 @@ pub(super) fn render_notes(frame: &mut Frame, app: &mut App, area: Rect) {
         };
 
         let pin_prefix = if note.data.pinned { "▲ " } else { "" };
+        let log_prefix = if let NoteKind::Shell { ref log_path, .. } = note.kind {
+            if log_path.is_some() { "● " } else { "" }
+        } else { "" };
         let title = if let Focus::Renaming(idx, ref input) = app.focus {
             if idx == i {
                 format!(" {}▌ ", input)
             } else {
-                format!(" {}{} ", pin_prefix, note.data.title)
+                format!(" {}{}{} ", log_prefix, pin_prefix, note.data.title)
             }
         } else if let Some((ref nb_title, page_num, total_pages, persistent)) = book_contexts.get(&note.data.id) {
             let persist_marker = if *persistent { " ∞" } else { "" };
-            format!(" 📒 {}{} [{}/{}] : {} ", nb_title, persist_marker, page_num, total_pages, note.data.title)
+            format!(" {}📒 {}{} [{}/{}] : {} ", log_prefix, nb_title, persist_marker, page_num, total_pages, note.data.title)
         } else {
-            format!(" {}{} ", pin_prefix, note.data.title)
+            format!(" {}{}{} ", log_prefix, pin_prefix, note.data.title)
         };
 
         let bg_color = {

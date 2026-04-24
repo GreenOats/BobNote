@@ -59,6 +59,7 @@ pub type PhotoRow = Vec<PhotoCell>;
 use std::{
     collections::VecDeque,
     fs,
+    io::BufWriter,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -119,6 +120,11 @@ pub enum NoteKind {
         /// issued, so history is unaffected and own_scrollback is preserved.
         /// Set on restored shell notes to hide startup noise (cd, prompts, motd).
         startup_clear_pending: bool,
+        /// Active log file writer — `Some` means logging is on for this shell.
+        /// Dropped (flushed + closed) automatically when set back to `None`.
+        log_file: Option<BufWriter<fs::File>>,
+        /// Path of the currently active log file; `None` when not logging.
+        log_path: Option<PathBuf>,
     },
 }
 
@@ -300,6 +306,8 @@ impl Note {
                 active_app: None,
                 detected_bg: None,
                 startup_clear_pending: false,
+                log_file: None,
+                log_path: None,
             },
         })
     }
@@ -342,6 +350,8 @@ impl Note {
                     active_app: None,
                     detected_bg: None,
                     startup_clear_pending: true,
+                    log_file: None,
+                    log_path: None,
                 },
                 data,
             })

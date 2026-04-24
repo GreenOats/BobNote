@@ -259,6 +259,83 @@ pub fn capture_screen_before_resize(
 // Photo capture
 // ---------------------------------------------------------------------------
 
+/// Capture a rectangular region from a shell's **fully-rendered** view.
+///
+/// Unlike `capture_region`, which reads only from the vt100 parser, this
+/// function also consults `own_scrollback` for rows that have scrolled past
+/// what vt100 can reach (when `scroll_offset > vt100_depth`).
+///
+/// `row1`/`row2` are **shell-area-relative** (0-based from the shell area top,
+/// i.e., with `BG_SHELL_INSET` already subtracted from screen-absolute rows).
+/// `col1`/`col2` are ordinary column indices.
+///
+/// The parser must have `set_scrollback` already applied by the run loop so
+/// that `parser.screen().scrollback()` reflects the current scroll depth.
+pub fn capture_rendered_region(
+    parser: &vt100::Parser,
+    scroll_offset: i64,
+    own_scrollback: &VecDeque<CapturedRow>,
+    row1: u16, col1: u16,
+    row2: u16, col2: u16,
+) -> Vec<PhotoRow> {
+    let vt100_depth = parser.screen().scrollback() as i64;
+    // How many visual rows at the top come from own_scrollback instead of vt100.
+    let own_sb_rows_needed = (scroll_offset - vt100_depth).max(0) as usize;
+    // Index into own_scrollback for the first visible row.
+    let top_idx = own_scrollback.len()
+        .saturating_sub(scroll_offset.max(0) as usize);
+    // When scroll_offset is negative the parser renders from this row downward
+    // (Alacritty-style blank rows above the prompt).
+    let parser_row_base = scroll_offset.min(0).unsigned_abs() as u16;
+
+    let r1 = row1.min(row2);
+    let r2 = row1.max(row2);
+    let c1 = col1.min(col2);
+    let c2 = col1.max(col2);
+
+    (r1..=r2).map(|r| {
+        (c1..=c2).map(|c| {
+            if (r as usize) < own_sb_rows_needed {
+                // Row is served by own_scrollback in the renderer.
+                let sb_idx = top_idx + r as usize;
+                own_scrollback
+                    .get(sb_idx)
+                    .and_then(|row_data| row_data.get(c as usize))
+                    .map(|(sym, fg, bg, modifier)| PhotoCell {
+                        sym: sym.clone(),
+                        fg: SerColor::from(*fg),
+                        bg: SerColor::from(*bg),
+                        bold:      modifier.contains(Modifier::BOLD),
+                        italic:    modifier.contains(Modifier::ITALIC),
+                        underline: modifier.contains(Modifier::UNDERLINED),
+                        reversed:  modifier.contains(Modifier::REVERSED),
+                    })
+                    .unwrap_or_default()
+            } else {
+                // Row is served by PtyView in the renderer.
+                let parser_row = if own_sb_rows_needed > 0 {
+                    // In own_sb territory: PtyView starts at parser row 0 below the
+                    // own_sb block, so subtract the own_sb offset.
+                    (r as usize - own_sb_rows_needed) as u16
+                } else {
+                    // Not in own_sb territory; apply negative-scroll base offset.
+                    r + parser_row_base
+                };
+                parser.screen().cell(parser_row, c)
+                    .map_or_else(PhotoCell::default, |cell| PhotoCell {
+                        sym:       cell.contents(),
+                        fg:        SerColor::from(map_color(cell.fgcolor())),
+                        bg:        SerColor::from(map_color(cell.bgcolor())),
+                        bold:      cell.bold(),
+                        italic:    cell.italic(),
+                        underline: cell.underline(),
+                        reversed:  cell.inverse(),
+                    })
+            }
+        }).collect()
+    }).collect()
+}
+
 /// Capture a rectangular region of the vt100 screen into a `Vec<PhotoRow>`.
 /// Coordinates are inclusive and automatically normalised (min/max).
 pub fn capture_region(

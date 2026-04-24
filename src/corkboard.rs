@@ -187,12 +187,12 @@ impl App {
                 } else if let Some(nb) = self.notebooks.iter_mut().find(|nb| nb.id == nb_id) {
                     nb.title = title;
                 }
-                self.focus = Focus::Shell;
+                self.focus = self.focus_for_active_workspace();
             }
             KeyCode::Esc => {
                 // Cancel — remove the empty notebook that was pre-created.
                 self.notebooks.retain(|nb| nb.id != nb_id);
-                self.focus = Focus::Shell;
+                self.focus = self.focus_for_active_workspace();
             }
             KeyCode::Backspace => {
                 input.pop();
@@ -349,10 +349,10 @@ impl App {
                 if !input.trim().is_empty() {
                     self.notes[note_idx].data.title = input;
                 }
-                self.focus = Focus::Shell;
+                self.focus = self.focus_for_active_workspace();
             }
             KeyCode::Esc => {
-                self.focus = Focus::Shell;
+                self.focus = self.focus_for_active_workspace();
             }
             KeyCode::Backspace => {
                 input.pop();

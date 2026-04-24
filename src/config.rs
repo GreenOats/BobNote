@@ -74,6 +74,7 @@ pub struct Config {
     pub visual_select: KeyBind,
     pub snapshot_photo: KeyBind,
     pub toggle_item: KeyBind,
+    pub toggle_log: KeyBind,
 
     // ── Corkboard notebook page reordering ───────────────────────────────────
     pub reorder_left: KeyBind,
@@ -120,6 +121,7 @@ impl Config {
             visual_select:    kb("ctrl+v"),
             snapshot_photo:   kb("ctrl+y"),
             toggle_item:      kb("ctrl+x"),
+            toggle_log:       kb("alt+i"),
 
             reorder_left:     kb("ctrl+left"),
             reorder_right:    kb("ctrl+right"),
@@ -211,6 +213,7 @@ impl Config {
         override_bind!(visual_select,    "visual_select");
         override_bind!(snapshot_photo,   "snapshot_photo");
         override_bind!(toggle_item,      "toggle_item");
+        override_bind!(toggle_log,       "toggle_log");
         override_bind!(reorder_left,     "reorder_left");
         override_bind!(reorder_right,    "reorder_right");
         override_bind!(reorder_up,       "reorder_up");
@@ -341,6 +344,7 @@ copy             = "ctrl+c"   # Copy selection to clipboard (text notes)
 visual_select    = "ctrl+v"   # Enter visual-select mode
 snapshot_photo   = "ctrl+y"   # Snapshot shell note as a photo note
 toggle_item      = "ctrl+x"   # Toggle checklist item [ ]/[x]
+toggle_log       = "alt+i"      # Toggle PTY output logging on/off for shell notes
 
 # ── Corkboard ──────────────────────────────────────────────────────────────
 # Page reordering inside a notebook sub-grid (replaces old Shift+arrows).

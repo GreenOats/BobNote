@@ -284,6 +284,90 @@ pub(super) fn render_notebook_picker(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
+// Logging setup popup
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_logging_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let Focus::LoggingSetup(note_idx, ref input) = app.focus else { return; };
+
+    let note_title = app.notes[note_idx].data.title.as_str();
+    let title = format!(" Start logging: {} ", note_title);
+
+    // Show the default path as a placeholder hint when the field is empty.
+    let default_path = app.default_log_path(note_idx);
+    let display_path = if input.is_empty() {
+        default_path.as_str()
+    } else {
+        input.as_str()
+    };
+    // Truncate path for display if it is very long.
+    let max_inner_w = area.width.saturating_sub(6) as usize;
+    let display_truncated = if display_path.len() > max_inner_w && max_inner_w > 3 {
+        format!("...{}", &display_path[display_path.len().saturating_sub(max_inner_w - 3)..])
+    } else {
+        display_path.to_string()
+    };
+
+    let cursor_line = if input.is_empty() {
+        // Placeholder: dim hint showing default path
+        format!(" {} ", display_truncated)
+    } else {
+        format!(" {}▌ ", display_truncated)
+    };
+
+    let popup_w = (cursor_line.len() as u16 + 4)
+        .max(title.len() as u16 + 4)
+        .max(50)
+        .min(area.width.saturating_sub(4));
+    let popup_h = 7u16;
+    let popup_area = super::centered_rect(popup_w, popup_h, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(title.as_str())
+        .title_alignment(Alignment::Center)
+        .border_style(
+            Style::default()
+                .fg(Color::Rgb(220, 80, 80))
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(Color::Rgb(30, 10, 10)));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let path_label_style = Style::default().fg(Color::DarkGray);
+    let path_style = if input.is_empty() {
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(Color::Rgb(255, 180, 180))
+    };
+    let hint_style = Style::default().fg(Color::DarkGray);
+
+    use ratatui::text::{Line, Span};
+    let lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled("  Log path:", path_label_style)),
+        Line::from(Span::styled(cursor_line.as_str(), path_style)),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Leave blank to use the default path above.",
+            hint_style,
+        )),
+        Line::from(Span::styled(
+            "  Enter: start logging   Esc: cancel",
+            hint_style,
+        )),
+    ];
+    use ratatui::widgets::Paragraph;
+    use ratatui::text::Text;
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+// ---------------------------------------------------------------------------
 // Splash screen
 // ---------------------------------------------------------------------------
 
@@ -432,12 +516,26 @@ Block::new().bg(SPINE_FG),
   Rect::new(0, y, area.width, 1
     ));
 
-    // Scroll indicator on the left when the main terminal is scrolled back or forward
-    if app.scroll_offset != 0 {
-        let indicator = if app.scroll_offset > 0 {
-            format!(" ↑ SCROLL  -{} lines  PgDn↓ ", app.scroll_offset)
+    // Read scroll state and active-app info from the background shell note.
+    let (bg_scroll_offset, bg_active_app, bg_detected_bg) =
+        if let Some(bg_idx) = app.background_note_idx() {
+            if let crate::note::NoteKind::Shell { scroll_offset, active_app, detected_bg, .. } =
+                &app.notes[bg_idx].kind
+            {
+                (*scroll_offset, active_app.clone(), *detected_bg)
+            } else {
+                (0, None, None)
+            }
         } else {
-            format!(" ↓ -{} lines below  PgUp↑ ", app.scroll_offset.abs())
+            (0, None, None)
+        };
+
+    // Scroll indicator on the left when the background terminal is scrolled
+    if bg_scroll_offset != 0 {
+        let indicator = if bg_scroll_offset > 0 {
+            format!(" ↑ SCROLL  -{} lines  PgDn↓ ", bg_scroll_offset)
+        } else {
+            format!(" ↓ -{} lines below  PgUp↑ ", bg_scroll_offset.abs())
         };
         let ind_w = (indicator.len() as u16).min(area.width);
         frame.render_widget(
@@ -452,9 +550,8 @@ Block::new().bg(SPINE_FG),
         );
     }
 
-    // Active-app pill: shown to the right of the scroll indicator when a TUI app
-    // is detected in the main background terminal.
-    if let (Some(app_name), Some(bg)) = (&app.active_app, app.detected_bg) {
+    // Active-app pill: shown when a TUI app is detected in the background terminal.
+    if let (Some(app_name), Some(bg)) = (bg_active_app, bg_detected_bg) {
         let pill = format!("  {}  ", app_name);
         let pill_w = (pill.len() as u16).min(area.width);
         let pill_x = area.width.saturating_sub(pill_w);
@@ -480,33 +577,68 @@ Block::new().bg(SPINE_FG),
         }
     };
 
+    // Check if the focused shell note is actively logging — used for the REC indicator.
+    let active_log_path: Option<String> = match app.focus {
+        Focus::BackgroundShell(idx) | Focus::Note(idx, NoteType::Shell) => {
+            if let Some(note) = app.notes.get(idx) {
+                if let crate::note::NoteKind::Shell { ref log_path, .. } = note.kind {
+                    log_path.as_ref()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                } else { None }
+            } else { None }
+        }
+        _ => None,
+    };
+
     let hint = if in_book_mode && matches!(app.focus, Focus::Note(..)) {
-        " Tab: next page  Shift+Tab: prev page  Alt+O: next notebook  Ctrl+R: remove page  Ctrl+P: pin to board  Ctrl+E: shell  Ctrl+K: back to notebook "
+        " Tab: next page  Shift+Tab: prev page  Alt+O: next notebook  Ctrl+R: remove page  Ctrl+P: pin to board  Ctrl+E: shell  Ctrl+K: back to notebook ".to_string()
     } else {
         match app.focus {
-            Focus::Shell =>
-                " Alt+Q: quit | Alt+B: board | Alt+N: note | Alt+L: checklist | Alt+T: new terminal | Alt+G: focus terminal | Alt+V: paste | Ctrl+V: screenshot | Alt+←/→: workspace | Alt+=: add ws | Alt+R: rename ws | F1: hints ",
             Focus::BackgroundShell(_) =>
-                " Alt+Q: quit | Alt+B: board | Alt+N: note | Alt+T: new terminal | Alt+G: focus terminal | Alt+V: paste | Alt+←/→: workspace | Alt+=: add ws | Alt+R: rename ws | Ctrl+E: main shell | PgUp/Dn: scroll | F1: hints ",
+                " Alt+Q: quit | Alt+B: board | Alt+N: note | Alt+T: new terminal | Alt+G: focus terminal | Alt+V: paste | Ctrl+V: screenshot | Alt+←/→: workspace | Alt+I: log | PgUp/Dn: scroll | F1: hints ".to_string(),
             Focus::Note(_, NoteType::Text) =>
-                " Ctrl+E: shell | Ctrl+W: close | Ctrl+P: pin | Alt+B: board | Ctrl+G: notebook | Tab: cycle | Ctrl+V: visual | Alt+C: copy | Alt+V: paste | Ctrl+T: rename | Ctrl+S: settings ",
+                " Ctrl+E: shell | Ctrl+W: close | Ctrl+P: pin | Alt+B: board | Ctrl+G: notebook | Tab: cycle | Ctrl+V: visual | Alt+C: copy | Alt+V: paste | Ctrl+T: rename | Ctrl+S: settings ".to_string(),
             Focus::Note(_, NoteType::Shell) =>
-                " Ctrl+E: shell | Alt+Space: cycle terminals |Ctrl+W: close | Ctrl+Y: snapshot | Ctrl+B: background | Ctrl+P: pin | Ctrl+F: top | Alt+V: paste | Alt+C: copy | Ctrl+S: settings | Alt+B: board ",
+                " Ctrl+E: shell | Alt+Space: cycle | Ctrl+W: close | Ctrl+Y: snapshot | Ctrl+B: background | Ctrl+P: pin | Alt+I: log | Alt+V: paste | Alt+C: copy | Ctrl+S: settings | Alt+B: board ".to_string(),
             Focus::Note(_, NoteType::Photo) =>
-                " Ctrl+W: close | Ctrl+C: copy | Ctrl+T: rename | Ctrl+P: pin | Ctrl+G: notebook | Ctrl+F: top | Alt+B: board ",
+                " Ctrl+W: close | Ctrl+C: copy | Ctrl+T: rename | Ctrl+P: pin | Ctrl+G: notebook | Ctrl+F: top | Alt+B: board ".to_string(),
             Focus::Note(_, NoteType::CheckList) =>
-                " Ctrl+E: shell | Ctrl+W: close | Ctrl+X: toggle | Ctrl+T: rename | Ctrl+S: settings | Ctrl+P: pin | Alt+B: board | Ctrl+G: notebook | Tab: cycle ",
-            Focus::RenamingWorkspace(_) => " Enter: confirm | Esc: cancel ",
-            Focus::Renaming(_, _) => " Enter: confirm | Esc: cancel ",
-            Focus::NamingNotebook(_, _) => " Enter: confirm notebook name | Esc: cancel ",
-            Focus::Settings(_, _) => " Tab/↑↓: section  ←→: colour  Space: toggle border  Esc: close ",
-            Focus::Selecting { .. } => " [ SCREENSHOT MODE ]  Drag or hjkl/arrows to select  Enter/y: photo  Alt+C: copy text  Esc: exit ",
-            Focus::TextVisual { .. } => " [ VISUAL SELECT ]  hjkl/arrows move  w/b word  0/$ line  y/Alt+C: copy  Esc: cancel ",
+                " Ctrl+E: shell | Ctrl+W: close | Ctrl+X: toggle | Ctrl+T: rename | Ctrl+S: settings | Ctrl+P: pin | Alt+B: board | Ctrl+G: notebook | Tab: cycle ".to_string(),
+            Focus::RenamingWorkspace(_) => " Enter: confirm | Esc: cancel ".to_string(),
+            Focus::Renaming(_, _) => " Enter: confirm | Esc: cancel ".to_string(),
+            Focus::NamingNotebook(_, _) => " Enter: confirm notebook name | Esc: cancel ".to_string(),
+            Focus::Settings(_, _) => " Tab/↑↓: section  ←→: colour  Space: toggle border  Esc: close ".to_string(),
+            Focus::Selecting { .. } => " [ SCREENSHOT MODE ]  Drag or hjkl/arrows to select  Enter/y: photo  Alt+C: copy text  Esc: exit ".to_string(),
+            Focus::TextVisual { .. } => " [ VISUAL SELECT ]  hjkl/arrows move  w/b word  0/$ line  y/Alt+C: copy  Esc: cancel ".to_string(),
+            Focus::LoggingSetup(_, _) => " Enter: start logging | Esc: cancel ".to_string(),
         }
     };
 
-    let width = (hint.len() as u16).min(area.width);
-    let x = area.width.saturating_sub(width);
+    // ● REC indicator: shown to the left of the hint when a shell is logging.
+    let rec_right_offset = if let Some(ref filename) = active_log_path {
+        let rec = format!(" ● REC: {} ", filename);
+        let rec_w = (rec.len() as u16).min(area.width);
+        let rec_x = area.width.saturating_sub(rec_w);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                rec.as_str(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(220, 60, 60))
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            Rect::new(rec_x, y, rec_w, 1),
+        );
+        rec_w
+    } else {
+        0
+    };
+
+    let avail_w = area.width.saturating_sub(rec_right_offset);
+    let width = (hint.len() as u16).min(avail_w);
+    let x = avail_w.saturating_sub(width);
 
     let hint_style = if matches!(app.focus, Focus::Selecting { .. } | Focus::TextVisual { .. }) {
         Style::default()
@@ -520,7 +652,7 @@ Block::new().bg(SPINE_FG),
             .add_modifier(Modifier::BOLD)
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, hint_style))),
+        Paragraph::new(Line::from(Span::styled(hint.as_str(), hint_style))),
         Rect::new(x, y, width, 1),
     );
 }
