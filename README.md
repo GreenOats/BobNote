@@ -1,15 +1,22 @@
+
+
 # BobNote: A Sticky Notes Tool & Terminal Multiplexer
 
 _BobNote_, named after my cat (Bob, short for Crowbar), is a sticky notes application I created because I ran out of space in my notebook. However, after a few weeks of tinkering, and the addition of "Shell Notes", which came from the need to already create a super basic terminal emulator for the tool to function, I have begun to use it as my main terminal multiplexer, which is why I am posting it here. This application works similarly to a Window Manager or desktop environment and supports both mouse and keyboard usage. You can see the gif below for a quick demo of BobNote in action:
 
+<img width="1045" height="638" alt="test2" src="https://github.com/user-attachments/assets/efe451f3-2562-404d-b80a-7d92fa7743bb" />
 
 _The Hotkey list is below this quick introduction to the functions and features of BobNote. The following screenshots show the basic usage of the BobNote app. I should also mention that claude was used in the development of this tool to speed things up a little. I hope that this application proves useful to you!_
 
-<img width="1045" height="638" alt="test2" src="https://github.com/user-attachments/assets/cf97e26a-3150-4122-9271-84379bd241d9" />
+
 
 ---
 
-<img width="1858" height="966" alt="bobnote1" src="https://github.com/user-attachments/assets/f705516e-4013-4f9c-add4-2149229b51d8" />
+# Basic Usage
+
+
+<img width="1041" height="636" alt="test3" src="https://github.com/user-attachments/assets/aa8a627c-a9eb-4b44-ab68-f89b98bb3ed3" />
+
 
 As can be seen above, there are multiple workspaces, which work similarly to any window manager that you may be familiar with. I tried to keep everything as convenient as possible with the design of this application, in the spirit of this I also included a ".bobrc" configuration file which is created in the home directory when _BobNote_ is run for the first time:
 
@@ -23,6 +30,9 @@ Now, to organize these notes, I was left with a decision. I settled on creating 
 \
 Some of my favourite features implemented so far include the screenshots, which can easily be copied and pasted for documentation and reporting purposes:
 <p align="center">
+
+  <img width="1041" height="636" alt="photo" src="https://github.com/user-attachments/assets/daca696a-723d-406d-8da1-f95563c6365f" />
+
   <img width="314" height="176" alt="bobnotephoto" src="https://github.com/user-attachments/assets/72c2e0b4-e234-4274-8939-22dcc834d868" />
 </p>
   
@@ -90,6 +100,7 @@ Active when a workspace's dedicated background terminal has focus (`Ctrl+E` from
 | `Ctrl+V` | Enter screenshot mode |
 | `Alt+←` / `Alt+→` | Switch workspace |
 | `Alt+=` / `Alt+-` | Add / remove workspace |
+| `Alt+I` | Start Logging to File |
 | *(any other key)* | Sent to this workspace's shell |
 
 ---
@@ -150,6 +161,7 @@ Active whenever any floating note has focus.
 | `Ctrl+C` | Send SIGINT to the shell (pass-through) |
 | `Alt+C` | Copy selected text to clipboard |
 | `Alt+V` | Paste from clipboard |
+| `Alt+I` | Start Logging to File |
 | `PageUp` | Scroll terminal history up |
 | `PageDown` | Scroll terminal history down |
 | *(any other key)* | Sent directly to the terminal |
