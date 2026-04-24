@@ -1,0 +1,31 @@
+[package]
+name = "bobnote"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bobnote"
+path = "src/main.rs"
+
+[dependencies]
+# TUI rendering
+ratatui = "0.29"
+crossterm = "0.28"
+
+# PTY management — spawns a real shell subprocess
+portable-pty = "0.8"
+
+# Terminal emulator parser — turns raw PTY bytes into a queryable cell grid
+vt100 = "0.15"
+
+# Text editor widget for ratatui (handles cursor, multi-line, input events)
+tui-textarea = { version = "0.7", features = ["crossterm"] }
+
+# Persistence
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+anyhow = "1"
+dirs = "5"
+arboard = "3"
+toml = "0.8"
