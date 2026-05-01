@@ -132,17 +132,18 @@ impl Config {
 
     /// Load config from `~/.bobrc`, creating it with defaults if absent.
     /// Falls back to built-in defaults on any error (parse or I/O).
-    pub fn load() -> Self {
+    /// Also returns the `bg_color_apps` list parsed from the same file read.
+    pub fn load() -> (Self, Vec<String>) {
         match Self::try_load() {
-            Ok(cfg) => cfg,
+            Ok(result) => result,
             Err(e) => {
                 eprintln!("BobNote: config error — {e}. Using built-in defaults.");
-                Self::defaults()
+                (Self::defaults(), vec!["nvim".to_string(), "vim".to_string()])
             }
         }
     }
 
-    fn try_load() -> Result<Self> {
+    fn try_load() -> Result<(Self, Vec<String>)> {
         let path = {
             let home = dirs::home_dir().context("cannot determine home directory")?;
             home.join(".bobrc")
@@ -151,7 +152,7 @@ impl Config {
         if !path.exists() {
             std::fs::write(&path, DEFAULT_RC)
                 .with_context(|| format!("creating {}", path.display()))?;
-            return Ok(Self::defaults());
+            return Ok((Self::defaults(), vec!["nvim".to_string(), "vim".to_string()]));
         }
 
         let src = std::fs::read_to_string(&path)
@@ -219,36 +220,15 @@ impl Config {
         override_bind!(reorder_up,       "reorder_up");
         override_bind!(reorder_down,     "reorder_down");
 
-        Ok(cfg)
-    }
-
-    /// Load the list of app names for which background-colour fill is enabled.
-    ///
-    /// Read from `bg_color_apps` in `~/.bobrc`.  An empty list disables the
-    /// feature entirely.  Falls back to `["nvim", "vim"]` on any error.
-    pub fn load_bg_color_apps() -> Vec<String> {
-        let defaults = || vec!["nvim".to_string(), "vim".to_string()];
-
-        let path = match dirs::home_dir() {
-            Some(h) => h.join(".bobrc"),
-            None => return defaults(),
-        };
-        let src = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(_) => return defaults(),
-        };
-        let raw: toml::Table = match src.parse() {
-            Ok(t) => t,
-            Err(_) => return defaults(),
-        };
-
-        match raw.get("bg_color_apps") {
+        let bg_color_apps = match raw.get("bg_color_apps") {
             Some(toml::Value::Array(arr)) => arr
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect(),
-            _ => defaults(),
-        }
+            _ => vec!["nvim".to_string(), "vim".to_string()],
+        };
+
+        Ok((cfg, bg_color_apps))
     }
 }
 

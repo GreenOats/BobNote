@@ -302,7 +302,7 @@ impl App {
     pub fn new() -> Result<Self> {
         let (cols, rows) = crossterm::terminal::size()?;
         // Load config first so shell_scrollback is available for note creation.
-        let config = Config::load();
+        let (config, bg_color_apps) = Config::load();
 
         // Load any previously saved notes and notebooks from disk.
         let mut notes = note::load_notes(config.shell_scrollback).unwrap_or_default();
@@ -373,7 +373,7 @@ impl App {
 
         Ok(Self {
             config,
-            bg_color_apps: Config::load_bg_color_apps(),
+            bg_color_apps,
             notes,
             focus: initial_focus,
             drag: None,
@@ -632,9 +632,13 @@ impl App {
                         if let Some(pid) = pty.shell_pid {
                             let new_app = foreground_app(pid);
                             if new_app != *active_app {
-                                // App exited → clear the detected colour so the
-                                // border reverts to the user's chosen palette colour.
-                                if new_app.is_none() {
+                                // Clear the detected colour whenever the new app is not
+                                // in bg_color_apps (including when it exits entirely),
+                                // so the border reverts to the user's chosen palette colour.
+                                let new_in_list = new_app.as_deref()
+                                    .map(|n| self.bg_color_apps.iter().any(|a| a == n))
+                                    .unwrap_or(false);
+                                if !new_in_list {
                                     *detected_bg = None;
                                 }
                                 *active_app = new_app;
