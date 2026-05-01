@@ -160,6 +160,8 @@ pub enum DragMode {
 pub struct App {
     /// User key-binding configuration loaded from `~/.bobrc`.
     pub config: Config,
+    /// Apps for which background-colour fill is active (from `bg_color_apps` in ~/.bobrc).
+    bg_color_apps: Vec<String>,
     pub notes: Vec<Note>,
     pub focus: Focus,
     pub drag: Option<DragMode>,
@@ -371,6 +373,7 @@ impl App {
 
         Ok(Self {
             config,
+            bg_color_apps: Config::load_bg_color_apps(),
             notes,
             focus: initial_focus,
             drag: None,
@@ -636,12 +639,15 @@ impl App {
                                 }
                                 *active_app = new_app;
                             }
-                            // While an app is active, keep the sampled colour fresh.
+                            // While an app is active, keep the sampled colour fresh —
+                            // but only for apps listed in bg_color_apps.
                             // sample_bg_color returns None for plain terminal backgrounds,
                             // so we only overwrite when we get a real colour reading.
-                            if active_app.is_some() {
-                                if let Some(color) = sample_bg_color(parser) {
-                                    *detected_bg = Some(color);
+                            if let Some(ref app_name) = *active_app {
+                                if self.bg_color_apps.iter().any(|a| a == app_name) {
+                                    if let Some(color) = sample_bg_color(parser) {
+                                        *detected_bg = Some(color);
+                                    }
                                 }
                             }
                         }

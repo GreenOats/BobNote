@@ -221,6 +221,35 @@ impl Config {
 
         Ok(cfg)
     }
+
+    /// Load the list of app names for which background-colour fill is enabled.
+    ///
+    /// Read from `bg_color_apps` in `~/.bobrc`.  An empty list disables the
+    /// feature entirely.  Falls back to `["nvim", "vim"]` on any error.
+    pub fn load_bg_color_apps() -> Vec<String> {
+        let defaults = || vec!["nvim".to_string(), "vim".to_string()];
+
+        let path = match dirs::home_dir() {
+            Some(h) => h.join(".bobrc"),
+            None => return defaults(),
+        };
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return defaults(),
+        };
+        let raw: toml::Table = match src.parse() {
+            Ok(t) => t,
+            Err(_) => return defaults(),
+        };
+
+        match raw.get("bg_color_apps") {
+            Some(toml::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => defaults(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +327,13 @@ const DEFAULT_RC: &str = r#"# BobNote configuration (~/.bobrc)
 # Number of lines kept in the scrollback buffer for each shell note.
 # Higher values let you scroll further back but use more memory.
 shell_scrollback = 1000
+
+# Apps for which the background-colour fill is active.
+# When one of these programs is running in a shell note, BobNote samples its
+# background colour from the terminal and uses it to fill any empty cells so
+# the note blends seamlessly with the app's colour theme.
+# Set to an empty list [] to disable the feature entirely.
+bg_color_apps = ["nvim", "vim"]
 
 # ── Global ─────────────────────────────────────────────────────────────────
 # These work from any context (shell, note, corkboard).
